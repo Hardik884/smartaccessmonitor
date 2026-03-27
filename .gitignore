@@ -1,10 +1,40 @@
+# Virtual environment
+venv/
+env/
+.venv/
+
+# Python cache
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+
+# ML model files (too large for git)
 *.pkl
-*.db
+isolation_forest.pkl
+behavioral_profiles.pkl
+
+# Generated data files
 *.csv
+access_log.csv
+access_log_scored.csv
+
+# Database
+*.db
+access_monitor.db
+
+# Mac junk
 .DS_Store
+.AppleDouble
+
+# IDE
+.vscode/
+.idea/
+
+# Environment variables
 .env
+
+# Build stuff
 *.egg-info/
 dist/
-venv
+build/
