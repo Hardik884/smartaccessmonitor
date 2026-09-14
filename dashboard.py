@@ -423,7 +423,11 @@ def serial_worker(monitor, port_arg):
         try:
             ser.open()
         except (serial.SerialException, OSError) as exc:
-            msg = f"Could not open {port}: {exc}"
+            if "denied" in str(exc).lower() or "busy" in str(exc).lower():
+                msg = (f"{port} is in use by another program. Close the Arduino Serial Monitor "
+                       f"(only one program can read the port); the dashboard will connect on its own.")
+            else:
+                msg = f"Could not open {port}: {exc}"
             if msg != announced:
                 print(msg)
                 announced = msg
