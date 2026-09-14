@@ -1,800 +1,593 @@
 """
-Smart Access Monitor — Live Dashboard
-======================================
-Run:  python dashboard.py
-Open: http://localhost:5000
+Smart Access Monitor - dashboard
+================================
 
-DEMO MODE (no hardware needed):
-  python dashboard.py --demo
+    python dashboard.py                  live: finds the ESP32 serial port by itself
+    python dashboard.py --port COM5      live on a specific port (/dev/cu.usbserial-0001 on macOS)
+    python dashboard.py --demo           simulated events, kept in a separate database
 
-LIVE MODE (ESP32 connected):
-  python dashboard.py --port /dev/cu.usbserial-0001
+Then open http://127.0.0.1:5001
+
+Live mode never invents events. If the board isn't found or the cable is pulled,
+the dashboard says so and keeps retrying. Demo mode replays simulated working days
+(from the profiles in config.py) on a fast clock into access_monitor_demo.db, which
+is wiped at the start of each demo run, so it can't mix with real data.
+
+The reader understands both the JSON lines from firmware/smart_access_monitor
+and the plain-text output of the original sketch.
 """
 
 import argparse
 import json
 import os
-import pickle
 import random
+import re
 import sqlite3
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
-import numpy as np
-from flask import Flask, Response, jsonify, render_template_string
+from flask import Flask, Response, jsonify, request
 
-# ── Try importing serial (only needed in live mode) ──────────────────────────
+from config import (AUTHORIZED_KEYS, DEMO_DB, LIVE_DB, TAILGATE_WINDOW_S, UNKNOWN_PERSON,
+                    RISK_MEDIUM, person_for_key)
+from ml_models import AccessScorer
+
 try:
     import serial
-    SERIAL_AVAILABLE = True
+    from serial.tools import list_ports
 except ImportError:
-    SERIAL_AVAILABLE = False
+    serial = None
 
-app = Flask(__name__)
-DB_FILE = "access_monitor.db"
-DEMO_MODE = False
-SERIAL_PORT = None
+app = Flask(__name__, static_folder="static", static_url_path="/static")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DATABASE
-# ─────────────────────────────────────────────────────────────────────────────
+# USB-serial bridges found on ESP32 boards: CP210x, CH340/CH9102, FTDI, native USB (S2/S3/C3)
+ESP32_USB_VIDS = {0x10C4, 0x1A86, 0x0403, 0x303A}
+STALE_INSIDE_HOURS = 16
 
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT,
-            person TEXT,
-            mac TEXT,
-            action TEXT,
-            direction TEXT,
-            people_inside INTEGER,
-            anomaly_score INTEGER,
-            behavioral_score INTEGER,
-            alert_level TEXT,
-            reasons TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-def insert_event(event):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("""
-        INSERT INTO events
-        (timestamp, person, mac, action, direction, people_inside,
-         anomaly_score, behavioral_score, alert_level, reasons)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        event["timestamp"], event["person"], event["mac"],
-        event["action"], event["direction"], event["people_inside"],
-        event["anomaly_score"], event["behavioral_score"],
-        event["alert_level"], json.dumps(event["reasons"])
-    ))
-    conn.commit()
-    conn.close()
-
-def get_recent_events(limit=50):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("""
-        SELECT * FROM events ORDER BY id DESC LIMIT ?
-    """, (limit,))
-    rows = c.fetchall()
-    conn.close()
-    cols = ["id","timestamp","person","mac","action","direction",
-            "people_inside","anomaly_score","behavioral_score","alert_level","reasons"]
-    return [dict(zip(cols, row)) for row in rows]
-
-def get_stats():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT people_inside FROM events ORDER BY id DESC LIMIT 1")
-    row = c.fetchone()
-    people_inside = row[0] if row else 0
-
-    c.execute("SELECT COUNT(*) FROM events WHERE action='UNAUTHORIZED' OR alert_level='HIGH'")
-    alerts = c.fetchone()[0]
-
-    c.execute("SELECT COUNT(*) FROM events WHERE action='ENTER'")
-    total_entries = c.fetchone()[0]
-
-    c.execute("SELECT COUNT(*) FROM events WHERE DATE(timestamp) = DATE('now')")
-    today = c.fetchone()[0]
-
-    conn.close()
-    return {
-        "people_inside": people_inside,
-        "total_alerts": alerts,
-        "total_entries": total_entries,
-        "today_events": today
-    }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ML SCORING
+# Storage
 # ─────────────────────────────────────────────────────────────────────────────
 
-if_bundle = None
-profiles = None
+EVENT_COLUMNS = ["id", "timestamp", "source", "person", "ble_name", "mac", "action", "authorized",
+                 "reason", "rssi", "stay_min", "people_inside", "anomaly_score",
+                 "behavioral_score", "risk", "alert_level", "reasons"]
 
-def load_models():
-    global if_bundle, profiles
-    try:
-        with open("isolation_forest.pkl", "rb") as f:
-            if_bundle = pickle.load(f)
-        with open("behavioral_profiles.pkl", "rb") as f:
-            profiles = pickle.load(f)
-        print("✅ ML models loaded")
-    except FileNotFoundError:
-        print("⚠️  ML models not found — run ml_models.py first. Running without ML scoring.")
 
-def score_event(event):
-    if if_bundle is None or profiles is None:
-        return {"anomaly_score": 0, "behavioral_score": 0, "alert_level": "NORMAL", "reasons": []}
+class EventStore:
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.Lock()
+        self.conn = sqlite3.connect(path, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self._migrate()
 
-    result = {"anomaly_score": 0, "behavioral_score": 0, "alert_level": "NORMAL", "reasons": []}
-    features = if_bundle["features"]
+    def _migrate(self):
+        with self.lock:
+            cols = [r["name"] for r in self.conn.execute("PRAGMA table_info(events)")]
+            if cols and "source" not in cols:
+                # schema from the first version: keep the rows, but out of the way
+                legacy = f"events_legacy_{datetime.now():%Y%m%d%H%M%S}"
+                self.conn.execute(f"ALTER TABLE events RENAME TO {legacy}")
+                print(f"Old events table moved to {legacy}")
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    person TEXT NOT NULL,
+                    ble_name TEXT NOT NULL DEFAULT '',
+                    mac TEXT NOT NULL DEFAULT '',
+                    action TEXT NOT NULL,
+                    authorized INTEGER NOT NULL,
+                    reason TEXT NOT NULL DEFAULT '',
+                    rssi INTEGER,
+                    stay_min REAL,
+                    people_inside INTEGER,
+                    anomaly_score INTEGER,
+                    behavioral_score INTEGER,
+                    risk INTEGER,
+                    alert_level TEXT,
+                    reasons TEXT
+                )""")
+            self.conn.execute("CREATE INDEX IF NOT EXISTS events_ts ON events(timestamp)")
+            self.conn.commit()
 
-    try:
-        X = np.array([[event.get(f, 0) for f in features]])
-        X_scaled = if_bundle["scaler"].transform(X)
-        score = if_bundle["model"].decision_function(X_scaled)[0]
-        anomaly_score = min(100, max(0, int((-score + 0.3) * 100)))
-        result["anomaly_score"] = anomaly_score
-        if anomaly_score > 70:
-            result["reasons"].append(f"Unusual pattern (score: {anomaly_score})")
-    except Exception:
-        pass
+    def insert(self, event):
+        cols = [c for c in EVENT_COLUMNS if c != "id"]
+        row = {**event, "reasons": json.dumps(event["reasons"])}
+        with self.lock:
+            cur = self.conn.execute(
+                f"INSERT INTO events ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
+                [row[c] for c in cols])
+            self.conn.commit()
+            return cur.lastrowid
 
-    person = event.get("person", "UNKNOWN")
-    if person == "UNKNOWN":
-        result["behavioral_score"] = 100
-        result["reasons"].append("Unknown/unauthorized device")
-    elif profiles and person in profiles:
-        profile = profiles[person]
+    def query(self, sql, params=()):
+        with self.lock:
+            return [dict(r) for r in self.conn.execute(sql, params).fetchall()]
+
+    @staticmethod
+    def decode(row):
+        row["authorized"] = bool(row["authorized"])
         try:
-            X_bp = np.array([[event.get(f, 0) for f in profile["features"]]])
-            X_bp_scaled = profile["scaler"].transform(X_bp)
-            distances = [np.linalg.norm(X_bp_scaled[0] - c) for c in profile["model"].cluster_centers_]
-            min_dist = min(distances)
-            behavioral_score = min(100, int((min_dist / profile["threshold"]) * 50))
-            result["behavioral_score"] = behavioral_score
+            row["reasons"] = json.loads(row["reasons"] or "[]")
+        except ValueError:
+            row["reasons"] = []
+        return row
 
-            hour = event.get("hour", 12)
-            ns, ne = profile["normal_hours"]
-            if hour < ns - 2 or hour > ne + 2:
-                result["reasons"].append(f"{person} unusual hour: {hour}:00 (normal: {ns}:00–{ne}:00)")
+    def recent(self, limit=100, alerts_only=False):
+        where = "WHERE alert_level != 'NORMAL'" if alerts_only else ""
+        rows = self.query(f"SELECT * FROM events {where} ORDER BY id DESC LIMIT ?", (limit,))
+        return [self.decode(r) for r in rows]
 
-            dow = event.get("day_of_week", 0)
-            days = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
-            if dow not in profile["usual_days"]:
-                result["reasons"].append(f"{person} doesn't usually come on {days[dow]}")
+    def since(self, after, limit=200):
+        rows = self.query("SELECT * FROM events WHERE id > ? ORDER BY id ASC LIMIT ?", (after, limit))
+        return [self.decode(r) for r in rows]
 
-            if behavioral_score > 60:
-                result["reasons"].append(f"Behavioral mismatch — possible stolen credential")
-        except Exception:
-            pass
+    def day_summary(self, now):
+        day = (now.strftime("%Y-%m-%d"), (now + timedelta(days=1)).strftime("%Y-%m-%d"))
+        s = self.query("""
+            SELECT
+              SUM(action = 'ENTER')                    AS entries,
+              SUM(action = 'EXIT')                     AS exits,
+              SUM(alert_level != 'NORMAL')             AS alerts,
+              SUM(alert_level = 'HIGH')                AS high_alerts,
+              SUM(action = 'ENTER' AND authorized = 0) AS unidentified_entries
+            FROM events WHERE timestamp >= ? AND timestamp < ?""", day)[0]
+        hourly = [0] * 24
+        for r in self.query("""
+                SELECT CAST(substr(timestamp, 12, 2) AS INTEGER) AS h, COUNT(*) AS n
+                FROM events WHERE timestamp >= ? AND timestamp < ? AND action = 'ENTER'
+                GROUP BY h""", day):
+            hourly[r["h"]] = r["n"]
+        last = self.query("SELECT * FROM events ORDER BY id DESC LIMIT 1")
+        return {
+            **{k: int(v or 0) for k, v in s.items()},
+            "hourly_entries": hourly,
+            "last_event": self.decode(last[0]) if last else None,
+        }
 
-    combined = max(result["anomaly_score"], result["behavioral_score"])
-    if person == "UNKNOWN" or combined >= 80:
-        result["alert_level"] = "HIGH"
-    elif combined >= 50:
-        result["alert_level"] = "MEDIUM"
-    else:
-        result["alert_level"] = "NORMAL"
-
-    return result
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DEMO MODE — generates fake events automatically
+# Event processing (shared by live and demo)
 # ─────────────────────────────────────────────────────────────────────────────
 
-DEMO_PEOPLE = [
-    {"person": "Hardik",  "mac": "79:47:0e:74:97:a1"},
-    {"person": "Ekaansh", "mac": "aa:bb:cc:dd:ee:01"},
-    {"person": "Prof",    "mac": "aa:bb:cc:dd:ee:02"},
-]
-people_count = 0
+class Monitor:
+    def __init__(self, store, scorer, source, clock=datetime.now):
+        self.store = store
+        self.scorer = scorer
+        self.source = source
+        self.clock = clock          # demo mode swaps in a simulated clock
+        self.lock = threading.RLock()
+        self.serial = None
+        self.link = {"mode": source, "connected": source == "demo", "port": None,
+                     "firmware": None, "message": None, "last_message": None}
+        self.nearby = []            # [{key, person, rssi, age_ms}] from the last status line
+        self.nearby_at = 0.0
+        self.inside = {}            # person -> {"since": datetime, "ble_name": str}
+        self.last_key_entry = {}    # ble_name -> datetime, for tailgating on legacy firmware
+        self.count = 0
+        self.verbose = False
+        self._restore()
 
-def make_demo_event():
-    global people_count
-    now = datetime.now()
-    hour = now.hour
-    dow = now.weekday()
+    def _restore(self):
+        """Rebuild who is inside from the log, so a dashboard restart doesn't forget."""
+        cutoff = (datetime.now() - timedelta(hours=STALE_INSIDE_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
+        rows = self.store.query("""
+            SELECT e.person, e.ble_name, e.action, e.timestamp FROM events e
+            JOIN (SELECT person, MAX(id) AS id FROM events WHERE authorized = 1 GROUP BY person) last
+              ON e.id = last.id
+            WHERE e.timestamp >= ?""", (cutoff,))
+        for r in rows:
+            if r["action"] == "ENTER":
+                self.inside[r["person"]] = {"since": datetime.strptime(r["timestamp"], "%Y-%m-%d %H:%M:%S"),
+                                            "ble_name": r["ble_name"]}
+        last = self.store.query("SELECT people_inside FROM events ORDER BY id DESC LIMIT 1")
+        self.count = last[0]["people_inside"] if last else len(self.inside)
 
-    # 15% chance of anomaly / unauthorized
-    roll = random.random()
+    # ── link status ──
+    def set_link(self, **fields):
+        with self.lock:
+            self.link.update(fields)
 
-    if roll < 0.12:
-        # Unauthorized
-        event = {
-            "person": "UNKNOWN",
-            "mac": f"ff:{random.randint(10,99):02x}:{random.randint(10,99):02x}:xx:xx:xx",
-            "action": "UNAUTHORIZED",
-            "direction": "ENTERING",
-            "hour": hour,
-            "day_of_week": dow,
-            "stay_duration_min": 0,
-            "rssi": random.randint(-80, -60),
-        }
-    elif roll < 0.20:
-        # Anomalous authorized (e.g., 2am entry)
-        p = random.choice(DEMO_PEOPLE)
-        event = {
-            "person": p["person"],
-            "mac": p["mac"],
-            "action": "ENTER",
-            "direction": "ENTERING",
-            "hour": random.choice([1, 2, 3, 23]),
-            "day_of_week": 6,  # Sunday
-            "stay_duration_min": random.choice([5, 180, 240]),
-            "rssi": random.randint(-65, -45),
-        }
-    elif roll < 0.45:
-        # Normal exit
-        if people_count > 0:
-            p = random.choice(DEMO_PEOPLE)
-            people_count = max(0, people_count - 1)
-            event = {
-                "person": p["person"],
-                "mac": p["mac"],
-                "action": "EXIT",
-                "direction": "EXITING",
-                "hour": hour,
-                "day_of_week": dow,
-                "stay_duration_min": random.randint(30, 120),
-                "rssi": random.randint(-65, -45),
-            }
+    def attach_serial(self, ser):
+        with self.lock:
+            self.serial = ser
+
+    def send_command(self, text):
+        with self.lock:
+            if self.serial is not None:
+                try:
+                    self.serial.write((text + "\n").encode())
+                except Exception as exc:
+                    print(f"Could not send '{text}' to the board: {exc}")
+
+    # ── input ──
+    def handle_line(self, line, legacy):
+        with self.lock:
+            self.link["last_message"] = time.time()
+        if line.startswith("{"):
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                return
+            self.handle_message(msg)
         else:
-            p = random.choice(DEMO_PEOPLE)
-            people_count += 1
+            msg = legacy.feed(line)
+            if msg:
+                self.set_link(firmware="original sketch (text output)")
+                self.handle_message(msg)
+
+    def handle_message(self, msg):
+        kind = msg.get("evt")
+        if kind == "access":
+            self.handle_access(msg)
+        elif kind == "status":
+            with self.lock:
+                if msg.get("count") is not None:
+                    self.count = int(msg["count"])
+                if "keys" in msg:
+                    self.nearby = [{"key": k["key"], "person": person_for_key(k["key"]),
+                                    "rssi": k.get("rssi"), "age_ms": k.get("age", 0)} for k in msg["keys"]]
+                    self.nearby_at = time.time()
+        elif kind == "boot":
+            self.set_link(firmware=f"v{msg.get('fw', '?')}")
+            missing = [k for k in msg.get("keys", []) if k not in AUTHORIZED_KEYS]
+            if missing:
+                print(f"Keys on the board but not in config.py: {', '.join(missing)}")
+            with self.lock:
+                count = self.count
+            if count > 0:
+                # the board restarted (it does when the port opens); give it back the occupancy
+                self.send_command(f"COUNT {count}")
+
+    def handle_access(self, msg):
+        now = self.clock()
+        entering = msg.get("dir") == "ENTER"
+        action = "ENTER" if entering else "EXIT"
+        ble_name = msg.get("key") or ""
+        authorized = bool(msg.get("auth"))
+        reason = msg.get("reason") or ("key" if authorized else "no_key")
+        rssi = msg.get("rssi")
+        rules = []
+
+        with self.lock:
+            owner = person_for_key(ble_name) if ble_name else UNKNOWN_PERSON
+
+            # tailgating: the firmware checks this too, but the original sketch doesn't
+            last = self.last_key_entry.get(ble_name)
+            gap = (now - last).total_seconds() if last else None
+            if authorized and entering and gap is not None and gap < TAILGATE_WINDOW_S:
+                authorized, reason = False, "tailgate"
+            if reason == "tailgate":
+                when = f"{gap:.0f} s after" if gap is not None and gap < 60 else "right after"
+                rules.append((100, f"Second entry on {owner}'s key {when} the first (tailgating or shared key)"))
+
+            person = owner if authorized else UNKNOWN_PERSON
+            stay = None
+            if authorized and entering:
+                self.last_key_entry[ble_name] = now
+                if person in self.inside:
+                    since = self.inside[person]["since"]
+                    rules.append((RISK_MEDIUM + 5, f"{person} entered again without an exit since {since:%H:%M}"))
+                self.inside[person] = {"since": now, "ble_name": ble_name}
+            elif authorized and not entering:
+                self.last_key_entry.pop(ble_name, None)
+                visit = self.inside.pop(person, None)
+                if visit:
+                    stay = round((now - visit["since"]).total_seconds() / 60, 1)
+                else:
+                    rules.append((0, f"No entry recorded for {person} before this exit"))
+
+            if msg.get("count") is not None:
+                self.count = int(msg["count"])
+            elif authorized:   # original sketch: only keyed crossings change the count
+                self.count = self.count + 1 if entering else max(0, self.count - 1)
+
+            scores = self.scorer.score({
+                "timestamp": now, "person": owner if reason == "tailgate" else person, "action": action,
+                "authorized": authorized, "reason": reason, "rssi": rssi, "stay_duration_min": stay,
+            }, rule_hits=rules)
+
             event = {
-                "person": p["person"],
-                "mac": p["mac"],
-                "action": "ENTER",
-                "direction": "ENTERING",
-                "hour": hour,
-                "day_of_week": dow,
-                "stay_duration_min": random.randint(45, 120),
-                "rssi": random.randint(-65, -45),
+                "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"), "source": self.source,
+                "person": person, "ble_name": ble_name, "mac": msg.get("mac") or "",
+                "action": action, "authorized": int(authorized), "reason": reason, "rssi": rssi,
+                "stay_min": stay, "people_inside": self.count, **scores,
             }
-    else:
-        # Normal entry
-        p = random.choice(DEMO_PEOPLE)
-        people_count += 1
-        event = {
-            "person": p["person"],
-            "mac": p["mac"],
-            "action": "ENTER",
-            "direction": "ENTERING",
-            "hour": hour,
-            "day_of_week": dow,
-            "stay_duration_min": random.randint(45, 120),
-            "rssi": random.randint(-65, -45),
-        }
+            event["id"] = self.store.insert(event)
 
-    scores = score_event(event)
-    event.update({
-        "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
-        "people_inside": people_count,
-        "anomaly_score": scores["anomaly_score"],
-        "behavioral_score": scores["behavioral_score"],
-        "alert_level": scores["alert_level"],
-        "reasons": scores["reasons"],
-    })
-    return event
+        key_txt = f" ({ble_name}, {rssi} dBm)" if ble_name else ""
+        print(f"{now:%H:%M:%S}  {action:<5}  {person}{key_txt}  risk {scores['risk']} {scores['alert_level']}"
+              + "".join(f"\n            - {r}" for r in scores["reasons"]))
+        return event
 
-def demo_loop():
-    print("🎬 Demo mode running — generating events every 4 seconds")
-    while True:
-        event = make_demo_event()
-        insert_event(event)
-        level_icon = {"HIGH": "🚨", "MEDIUM": "⚠️", "NORMAL": "✅"}.get(event["alert_level"], "")
-        print(f"{level_icon} [{event['timestamp']}] {event['person']} {event['action']} | "
-              f"Alert: {event['alert_level']} | People: {event['people_inside']}")
-        time.sleep(4)
+    # ── output ──
+    def snapshot(self):
+        with self.lock:
+            now = self.clock()
+            inside = [{"person": p, "ble_name": v["ble_name"], "since": v["since"].strftime("%Y-%m-%d %H:%M:%S"),
+                       "minutes": int((now - v["since"]).total_seconds() // 60)}
+                      for p, v in sorted(self.inside.items(), key=lambda kv: kv[1]["since"])]
+            link = dict(self.link)
+            if link["last_message"]:
+                link["seconds_since_message"] = round(time.time() - link["last_message"], 1)
+            nearby = self.nearby if time.time() - self.nearby_at < 15 else []
+            return {
+                "now": now.strftime("%Y-%m-%d %H:%M:%S"),
+                "link": link,
+                "occupancy": {"total": max(self.count, len(inside)), "inside": inside,
+                              "unidentified": max(0, self.count - len(inside))},
+                "keys_nearby": nearby,
+                "models": self._model_info(),
+                "today": self.store.day_summary(now),
+                "authorized_keys": [{"key": k, "person": v["person"]} for k, v in AUTHORIZED_KEYS.items()],
+            }
+
+    def _model_info(self):
+        if not self.scorer.has_models:
+            return {"loaded": False}
+        b = self.scorer.bundle
+        return {"loaded": True, "trained_at": b.get("trained_at"), "profiles": sorted(b["profiles"])}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LIVE MODE — reads from ESP32 serial
+# Original sketch's text output
 # ─────────────────────────────────────────────────────────────────────────────
 
-def parse_serial_line(line, people_count_ref):
-    """Parse ESP32 serial output into an event dict."""
-    event = None
-    now = datetime.now()
-    hour = now.hour
-    dow = now.weekday()
+class LegacyParser:
+    """
+    Turns the original sketch's prints into access messages. That sketch never says
+    which key matched, so the key is the strongest configured name printed in the
+    "Device: <name> | RSSI: <n>" lines of the same scan.
+    """
+    DEVICE = re.compile(r"Device:\s*(.*?)\s*\|\s*RSSI:\s*(-?\d+)")
+    COUNT = re.compile(r"People inside:\s*(\d+)")
 
-    if "AUTHORIZED" in line and "UNAUTHORIZED" not in line:
-        direction = "ENTERING" if "ENTERING" in line else "EXITING"
-        action = "ENTER" if direction == "ENTERING" else "EXIT"
-        if direction == "ENTERING":
-            people_count_ref[0] += 1
-        else:
-            people_count_ref[0] = max(0, people_count_ref[0] - 1)
+    def __init__(self, rssi_min=-70):
+        self.rssi_min = rssi_min
+        self.direction = None
+        self.devices = {}
 
-        event = {
-            "person": "Authorized User",
-            "mac": "known",
-            "action": action,
-            "direction": direction,
-            "hour": hour,
-            "day_of_week": dow,
-            "stay_duration_min": 60,
-            "rssi": -55,
-            "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
-            "people_inside": people_count_ref[0],
-        }
+    def feed(self, line):
+        if "Direction:" in line:
+            self.direction = "ENTER" if "ENTERING" in line else "EXIT" if "EXITING" in line else None
+            self.devices = {}
+            return None
 
-    elif "UNAUTHORIZED" in line:
-        event = {
-            "person": "UNKNOWN",
-            "mac": "unknown",
-            "action": "UNAUTHORIZED",
-            "direction": "ENTERING",
-            "hour": hour,
-            "day_of_week": dow,
-            "stay_duration_min": 0,
-            "rssi": -70,
-            "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
-            "people_inside": people_count_ref[0],
-        }
+        m = self.DEVICE.search(line)
+        if m:
+            name, rssi = m.group(1), int(m.group(2))
+            self.devices[name] = max(rssi, self.devices.get(name, -999))
+            return None
 
-    if event:
-        scores = score_event(event)
-        event.update({
-            "anomaly_score": scores["anomaly_score"],
-            "behavioral_score": scores["behavioral_score"],
-            "alert_level": scores["alert_level"],
-            "reasons": scores["reasons"],
-        })
+        if line.startswith("Sensor A:"):
+            m = self.COUNT.search(line)
+            return {"evt": "status", "count": int(m.group(1))} if m else None
 
-    return event
+        if "UNAUTHORIZED" in line:
+            msg = {"evt": "access", "dir": self.direction or "ENTER", "auth": False, "key": "",
+                   "rssi": None, "reason": "no_key", "count": None}
+            self.direction, self.devices = None, {}
+            return msg
 
-def live_loop(port):
-    if not SERIAL_AVAILABLE:
-        print("❌ pyserial not installed. Run: pip install pyserial")
+        if "AUTHORIZED" in line:
+            direction = "ENTER" if "Welcome" in line else "EXIT" if "Goodbye" in line else self.direction
+            in_range = {n: r for n, r in self.devices.items() if r > self.rssi_min}
+            known = {n: r for n, r in in_range.items() if n in AUTHORIZED_KEYS}
+            pool = known or in_range
+            key = max(pool, key=pool.get) if pool else ""
+            m = self.COUNT.search(line)
+            msg = {"evt": "access", "dir": direction or "ENTER", "auth": True, "key": key,
+                   "rssi": pool.get(key), "reason": "key", "count": int(m.group(1)) if m else None}
+            self.direction, self.devices = None, {}
+            return msg
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Serial reader
+# ─────────────────────────────────────────────────────────────────────────────
+
+def find_esp32_port():
+    ports = list(list_ports.comports())
+    for p in ports:
+        if p.vid in ESP32_USB_VIDS:
+            return p.device, ports
+    return None, ports
+
+
+def serial_worker(monitor, port_arg):
+    if serial is None:
+        monitor.set_link(message="pyserial is not installed: pip install pyserial")
         return
 
-    people_count_ref = [0]
-    print(f"🔌 Connecting to ESP32 on {port}...")
-    try:
-        ser = serial.Serial(port, 115200, timeout=2)
-        print(f"✅ Connected to {port}")
-        while True:
+    announced = None
+    while True:
+        port, ports = (port_arg, None) if port_arg else find_esp32_port()
+        if not port:
+            names = ", ".join(p.device for p in ports) or "none"
+            msg = f"No ESP32 found (serial ports: {names}). Plug it in or pass --port."
+            if msg != announced:
+                print(msg)
+                announced = msg
+            monitor.set_link(connected=False, port=None, message=msg)
+            time.sleep(3)
+            continue
+
+        ser = serial.Serial()
+        ser.port, ser.baudrate, ser.timeout = port, 115200, 1
+        ser.dtr = ser.rts = False    # avoid resetting the board when the port opens
+        try:
+            ser.open()
+        except (serial.SerialException, OSError) as exc:
+            msg = f"Could not open {port}: {exc}"
+            if msg != announced:
+                print(msg)
+                announced = msg
+            monitor.set_link(connected=False, port=port, message=msg)
+            time.sleep(3)
+            continue
+
+        print(f"Connected to {port}")
+        announced = None
+        monitor.attach_serial(ser)
+        monitor.set_link(connected=True, port=port, message=None)
+        legacy = LegacyParser()
+        try:
+            while True:
+                raw = ser.readline()
+                if raw:
+                    line = raw.decode("utf-8", errors="replace").strip()
+                    if line:
+                        if monitor.verbose:
+                            print(f"  board> {line}")
+                        monitor.handle_line(line, legacy)
+        except (serial.SerialException, OSError) as exc:
+            print(f"Lost connection to {port}: {exc}")
+            monitor.set_link(connected=False, message=f"Lost connection to {port}. Retrying.")
+        finally:
+            monitor.attach_serial(None)
             try:
-                line = ser.readline().decode("utf-8", errors="ignore").strip()
-                if line:
-                    print(f"ESP32: {line}")
-                    event = parse_serial_line(line, people_count_ref)
-                    if event:
-                        insert_event(event)
-            except Exception as e:
-                print(f"Serial read error: {e}")
-                time.sleep(1)
-    except serial.SerialException as e:
-        print(f"❌ Could not open port {port}: {e}")
-        print("   Falling back to demo mode...")
-        demo_loop()
+                ser.close()
+            except Exception:
+                pass
+        time.sleep(2)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FLASK ROUTES
+# Demo: simulated working days, compressed, pushed through the same pipeline
 # ─────────────────────────────────────────────────────────────────────────────
+
+def plan_demo_day(day, rng):
+    """One day of firmware-style access messages built from the profiles in config.py."""
+    def keyed(direction, key, rssi=None):
+        return {"dir": direction, "auth": True, "key": key, "reason": "key",
+                "rssi": rssi if rssi is not None else rng.randint(-64, -48)}
+
+    def no_key(direction):
+        return {"dir": direction, "auth": False, "key": "", "rssi": None, "reason": "no_key"}
+
+    plan = []
+    for key, cfg in AUTHORIZED_KEYS.items():
+        p = cfg["profile"]
+        if rng.random() >= p["attendance"][day.weekday()]:
+            continue
+        t = day + timedelta(hours=rng.gauss(p["arrival_hour"], p["arrival_std"]))
+        for visit in range(2):
+            weak = rng.random() < 0.05
+            plan.append((t, keyed("ENTER", key, rng.randint(-75, -71) if weak else None)))
+            if rng.random() < 0.06:   # someone slips in behind them
+                plan.append((t + timedelta(seconds=rng.randint(2, 5)),
+                             {**keyed("ENTER", key), "auth": False, "reason": "tailgate"}))
+                plan.append((t + timedelta(minutes=rng.uniform(5, 40)), no_key("EXIT")))
+            t += timedelta(minutes=max(10, rng.gauss(p["stay_min"], p["stay_std"])))
+            plan.append((t, keyed("EXIT", key)))
+            if visit == 1 or rng.random() >= p["second_visit"]:
+                break
+            t += timedelta(minutes=rng.uniform(30, 120))
+
+    if rng.random() < 0.4:            # a visitor without a key
+        t = day + timedelta(hours=rng.uniform(9, 18))
+        plan += [(t, no_key("ENTER")), (t + timedelta(minutes=rng.uniform(2, 25)), no_key("EXIT"))]
+    if rng.random() < 0.2:            # a key holder at an odd hour
+        key = rng.choice(list(AUTHORIZED_KEYS))
+        t = day + timedelta(hours=rng.uniform(21, 23))
+        plan += [(t, keyed("ENTER", key)), (t + timedelta(minutes=rng.uniform(15, 50)), keyed("EXIT", key))]
+    return sorted(plan, key=lambda item: item[0])
+
+
+def demo_worker(monitor, interval, sim):
+    rng = random.Random()
+    day = sim["now"].replace(hour=0, minute=0, second=0, microsecond=0)
+    count = 0
+    print(f"Demo mode: simulated days starting {sim['now']:%d %b %H:%M}, one event every {interval:g} s, "
+          f"stored in {DEMO_DB}")
+    while True:
+        for when, msg in plan_demo_day(day, rng):
+            if when < sim["now"]:
+                continue
+            time.sleep(interval)
+            sim["now"] = when
+            count = count + 1 if msg["dir"] == "ENTER" else max(0, count - 1)
+            monitor.handle_message({"evt": "access", "mac": "", "count": count, **msg})
+            with monitor.lock:
+                monitor.link["last_message"] = time.time()
+            heard = ({msg["key"]} if msg["key"] else set()) | {k for k in AUTHORIZED_KEYS if rng.random() < 0.2}
+            monitor.handle_message({"evt": "status", "count": count, "keys": [
+                {"key": k, "rssi": msg["rssi"] if k == msg["key"] else rng.randint(-74, -60),
+                 "age": rng.randint(100, 3000)} for k in sorted(heard)]})
+        day += timedelta(days=1)
+        sim["now"] = day + timedelta(hours=7)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HTTP
+# ─────────────────────────────────────────────────────────────────────────────
+
+monitor = None
+
 
 @app.route("/")
 def index():
-    return render_template_string(HTML)
+    return app.send_static_file("dashboard.html")
+
+
+@app.route("/api/state")
+def api_state():
+    return jsonify(monitor.snapshot())
+
 
 @app.route("/api/events")
 def api_events():
-    events = get_recent_events(50)
-    for e in events:
-        if isinstance(e["reasons"], str):
-            try:
-                e["reasons"] = json.loads(e["reasons"])
-            except Exception:
-                e["reasons"] = []
-    return jsonify(events)
+    limit = min(int(request.args.get("limit", 100)), 500)
+    alerts = request.args.get("alerts") == "1"
+    return jsonify(monitor.store.recent(limit=limit, alerts_only=alerts))
 
-@app.route("/api/stats")
-def api_stats():
-    return jsonify(get_stats())
 
 @app.route("/api/stream")
-def stream():
-    """Server-Sent Events for real-time push to browser."""
-    def generate():
-        last_id = 0
+def api_stream():
+    after = int(request.headers.get("Last-Event-ID") or request.args.get("after") or 0)
+
+    def generate(last_id):
+        yield "retry: 3000\n\n"
         while True:
-            conn = sqlite3.connect(DB_FILE)
-            c = conn.cursor()
-            c.execute("SELECT * FROM events WHERE id > ? ORDER BY id ASC", (last_id,))
-            rows = c.fetchall()
-            conn.close()
-
-            for row in rows:
-                cols = ["id","timestamp","person","mac","action","direction",
-                        "people_inside","anomaly_score","behavioral_score","alert_level","reasons"]
-                event = dict(zip(cols, row))
+            for event in monitor.store.since(last_id):
                 last_id = event["id"]
-                try:
-                    event["reasons"] = json.loads(event["reasons"]) if event["reasons"] else []
-                except Exception:
-                    event["reasons"] = []
-                yield f"data: {json.dumps(event)}\n\n"
-
+                yield f"id: {last_id}\ndata: {json.dumps(event)}\n\n"
             time.sleep(1)
 
-    return Response(generate(), mimetype="text/event-stream")
+    return Response(generate(after), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
-# ─────────────────────────────────────────────────────────────────────────────
-# HTML DASHBOARD
-# ─────────────────────────────────────────────────────────────────────────────
-
-HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Smart Access Monitor</title>
-<style>
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { background: #0d1117; color: #e2e8f0; font-family: 'Segoe UI', system-ui, sans-serif; min-height: 100vh; }
-
-  .header {
-    background: #0d2137;
-    border-bottom: 2px solid #0e7490;
-    padding: 16px 24px;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-  }
-  .header h1 { font-size: 20px; font-weight: 700; color: #22d3ee; letter-spacing: 1px; }
-  .header .subtitle { font-size: 12px; color: #64748b; margin-top: 2px; }
-  .mode-badge {
-    background: #1e3a5f;
-    border: 1px solid #22d3ee;
-    color: #22d3ee;
-    padding: 4px 12px;
-    border-radius: 20px;
-    font-size: 11px;
-    font-weight: 700;
-    letter-spacing: 1px;
-  }
-  .live-dot {
-    display: inline-block;
-    width: 8px; height: 8px;
-    background: #10b981;
-    border-radius: 50%;
-    margin-right: 6px;
-    animation: pulse 1.5s infinite;
-  }
-  @keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.3; }
-  }
-
-  .stats-grid {
-    display: grid;
-    grid-template-columns: repeat(4, 1fr);
-    gap: 16px;
-    padding: 20px 24px;
-  }
-  .stat-card {
-    background: #1e293b;
-    border: 1px solid #1e3a5f;
-    border-radius: 10px;
-    padding: 16px 20px;
-  }
-  .stat-label { font-size: 11px; color: #64748b; text-transform: uppercase; letter-spacing: 1px; }
-  .stat-value { font-size: 36px; font-weight: 700; margin-top: 4px; }
-  .stat-card.people .stat-value { color: #22d3ee; }
-  .stat-card.alerts .stat-value { color: #ef4444; }
-  .stat-card.entries .stat-value { color: #10b981; }
-  .stat-card.today .stat-value { color: #f59e0b; }
-
-  .main { display: grid; grid-template-columns: 1fr 340px; gap: 0; padding: 0 24px 24px; }
-
-  .feed-section { }
-  .feed-title {
-    font-size: 13px; font-weight: 700; color: #94a3b8;
-    text-transform: uppercase; letter-spacing: 1px;
-    padding: 12px 0 10px;
-    border-bottom: 1px solid #1e3a5f;
-    margin-bottom: 12px;
-  }
-
-  .event-card {
-    background: #1e293b;
-    border: 1px solid #1e3a5f;
-    border-radius: 8px;
-    padding: 12px 14px;
-    margin-bottom: 8px;
-    display: flex;
-    align-items: flex-start;
-    gap: 12px;
-    animation: slideIn 0.3s ease;
-    border-left: 3px solid #1e3a5f;
-  }
-  .event-card.HIGH { border-left-color: #ef4444; background: #1e1a1a; }
-  .event-card.MEDIUM { border-left-color: #f59e0b; background: #1e1b14; }
-  .event-card.NORMAL { border-left-color: #10b981; }
-  @keyframes slideIn { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: translateY(0); } }
-
-  .event-icon { font-size: 20px; line-height: 1; margin-top: 2px; }
-  .event-body { flex: 1; }
-  .event-main { display: flex; align-items: center; gap: 8px; }
-  .event-person { font-weight: 700; font-size: 14px; }
-  .event-person.UNKNOWN { color: #ef4444; }
-  .event-action { font-size: 11px; padding: 2px 8px; border-radius: 4px; font-weight: 600; }
-  .event-action.ENTER { background: #064e3b; color: #34d399; }
-  .event-action.EXIT { background: #1e293b; color: #94a3b8; border: 1px solid #334155; }
-  .event-action.UNAUTHORIZED { background: #450a0a; color: #ef4444; }
-  .event-direction { font-size: 11px; color: #64748b; }
-  .event-time { font-size: 11px; color: #475569; margin-top: 3px; }
-  .event-reasons { margin-top: 5px; }
-  .event-reason { font-size: 11px; color: #f59e0b; margin-top: 2px; }
-  .event-reason::before { content: "⚠ "; }
-
-  .scores { display: flex; gap: 8px; margin-top: 6px; }
-  .score-pill {
-    font-size: 10px; padding: 2px 8px; border-radius: 10px;
-    background: #0d2137; color: #94a3b8;
-  }
-  .score-pill.high { background: #450a0a; color: #ef4444; }
-  .score-pill.medium { background: #451a03; color: #f59e0b; }
-
-  .sidebar { padding-left: 20px; }
-  .people-display {
-    background: #1e293b;
-    border: 1px solid #0e7490;
-    border-radius: 10px;
-    padding: 20px;
-    text-align: center;
-    margin-top: 41px;
-    margin-bottom: 16px;
-  }
-  .people-display .big-count {
-    font-size: 72px;
-    font-weight: 900;
-    color: #22d3ee;
-    line-height: 1;
-  }
-  .people-display .people-label { color: #64748b; font-size: 12px; margin-top: 6px; text-transform: uppercase; letter-spacing: 1px; }
-
-  .alert-box {
-    background: #1e293b;
-    border: 1px solid #1e3a5f;
-    border-radius: 10px;
-    padding: 16px;
-    margin-bottom: 16px;
-  }
-  .alert-box h3 { font-size: 11px; color: #64748b; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 10px; }
-  .alert-item {
-    background: #450a0a;
-    border-left: 3px solid #ef4444;
-    border-radius: 4px;
-    padding: 8px 10px;
-    margin-bottom: 6px;
-    font-size: 12px;
-    color: #fca5a5;
-  }
-  .alert-item.medium {
-    background: #451a03;
-    border-left-color: #f59e0b;
-    color: #fcd34d;
-  }
-  .alert-item .alert-time { font-size: 10px; color: #6b7280; margin-top: 3px; }
-  .no-alerts { color: #475569; font-size: 12px; }
-
-  .empty-state { text-align: center; color: #475569; padding: 40px 20px; font-size: 14px; }
-</style>
-</head>
-<body>
-
-<div class="header">
-  <div>
-    <h1>⚡ Smart Access Monitor</h1>
-    <div class="subtitle">Dual Ultrasonic + BLE + ML Anomaly Detection</div>
-  </div>
-  <div class="mode-badge" id="modeBadge">
-    <span class="live-dot"></span> LOADING...
-  </div>
-</div>
-
-<div class="stats-grid">
-  <div class="stat-card people">
-    <div class="stat-label">People Inside</div>
-    <div class="stat-value" id="statPeople">0</div>
-  </div>
-  <div class="stat-card alerts">
-    <div class="stat-label">Total Alerts</div>
-    <div class="stat-value" id="statAlerts">0</div>
-  </div>
-  <div class="stat-card entries">
-    <div class="stat-label">Total Entries</div>
-    <div class="stat-value" id="statEntries">0</div>
-  </div>
-  <div class="stat-card today">
-    <div class="stat-label">Today's Events</div>
-    <div class="stat-value" id="statToday">0</div>
-  </div>
-</div>
-
-<div class="main">
-  <div class="feed-section">
-    <div class="feed-title">📡 Live Event Feed</div>
-    <div id="eventFeed">
-      <div class="empty-state">Waiting for events...</div>
-    </div>
-  </div>
-
-  <div class="sidebar">
-    <div class="people-display">
-      <div class="big-count" id="bigCount">0</div>
-      <div class="people-label">People Inside Right Now</div>
-    </div>
-
-    <div class="alert-box">
-      <h3>🚨 Recent Alerts</h3>
-      <div id="alertList"><div class="no-alerts">No alerts yet</div></div>
-    </div>
-  </div>
-</div>
-
-<script>
-  const MAX_EVENTS = 30;
-  let allEvents = [];
-  let recentAlerts = [];
-
-  function getIcon(event) {
-    if (event.action === "UNAUTHORIZED") return "🚫";
-    if (event.alert_level === "HIGH") return "🚨";
-    if (event.alert_level === "MEDIUM") return "⚠️";
-    if (event.action === "EXIT") return "👋";
-    return "✅";
-  }
-
-  function formatTime(ts) {
-    return ts.split(" ")[1] || ts;
-  }
-
-  function scoreClass(score) {
-    if (score >= 70) return "high";
-    if (score >= 40) return "medium";
-    return "";
-  }
-
-  function renderEvent(event) {
-    const reasons = Array.isArray(event.reasons) ? event.reasons : [];
-    const reasonHtml = reasons.map(r => `<div class="event-reason">${r}</div>`).join("");
-    const aScore = event.anomaly_score || 0;
-    const bScore = event.behavioral_score || 0;
-
-    return `
-      <div class="event-card ${event.alert_level}">
-        <div class="event-icon">${getIcon(event)}</div>
-        <div class="event-body">
-          <div class="event-main">
-            <span class="event-person ${event.person === 'UNKNOWN' ? 'UNKNOWN' : ''}">${event.person}</span>
-            <span class="event-action ${event.action}">${event.action}</span>
-            <span class="event-direction">${event.direction || ""}</span>
-          </div>
-          <div class="event-time">${formatTime(event.timestamp)} &nbsp;·&nbsp; ${event.people_inside} inside &nbsp;·&nbsp; MAC: ${(event.mac || "").substring(0,17)}</div>
-          <div class="scores">
-            <span class="score-pill ${scoreClass(aScore)}">Anomaly: ${aScore}</span>
-            <span class="score-pill ${scoreClass(bScore)}">Behavioral: ${bScore}</span>
-          </div>
-          ${reasonHtml ? `<div class="event-reasons">${reasonHtml}</div>` : ""}
-        </div>
-      </div>
-    `;
-  }
-
-  function renderAlerts() {
-    const alertDiv = document.getElementById("alertList");
-    const alerts = recentAlerts.slice(0, 6);
-    if (alerts.length === 0) {
-      alertDiv.innerHTML = '<div class="no-alerts">No alerts yet</div>';
-      return;
-    }
-    alertDiv.innerHTML = alerts.map(e => {
-      const reasons = Array.isArray(e.reasons) ? e.reasons : [];
-      const cls = e.alert_level === "HIGH" ? "" : "medium";
-      return `
-        <div class="alert-item ${cls}">
-          <strong>${e.person}</strong> — ${e.action}
-          ${reasons.length ? "<br>" + reasons[0] : ""}
-          <div class="alert-time">${formatTime(e.timestamp)}</div>
-        </div>
-      `;
-    }).join("");
-  }
-
-  function updateStats() {
-    fetch("/api/stats")
-      .then(r => r.json())
-      .then(stats => {
-        document.getElementById("statPeople").textContent = stats.people_inside;
-        document.getElementById("statAlerts").textContent = stats.total_alerts;
-        document.getElementById("statEntries").textContent = stats.total_entries;
-        document.getElementById("statToday").textContent = stats.today_events;
-        document.getElementById("bigCount").textContent = stats.people_inside;
-      });
-  }
-
-  // Load initial events
-  fetch("/api/events")
-    .then(r => r.json())
-    .then(events => {
-      events.reverse().forEach(e => {
-        allEvents.unshift(e);
-        if (e.alert_level !== "NORMAL") recentAlerts.unshift(e);
-      });
-      const feed = document.getElementById("eventFeed");
-      if (allEvents.length > 0) {
-        feed.innerHTML = allEvents.slice(0, MAX_EVENTS).map(renderEvent).join("");
-      }
-      renderAlerts();
-      updateStats();
-    });
-
-  // Server-sent events for real-time updates
-  const evtSource = new EventSource("/api/stream");
-  evtSource.onmessage = function(e) {
-    const event = JSON.parse(e.data);
-    allEvents.unshift(event);
-    if (allEvents.length > MAX_EVENTS) allEvents.pop();
-
-    if (event.alert_level !== "NORMAL") {
-      recentAlerts.unshift(event);
-      if (recentAlerts.length > 10) recentAlerts.pop();
-    }
-
-    const feed = document.getElementById("eventFeed");
-    feed.innerHTML = allEvents.slice(0, MAX_EVENTS).map(renderEvent).join("");
-    renderAlerts();
-    updateStats();
-
-    document.getElementById("modeBadge").innerHTML =
-      '<span class="live-dot"></span> LIVE';
-  };
-
-  evtSource.onerror = function() {
-    document.getElementById("modeBadge").innerHTML = "⚡ RECONNECTING...";
-  };
-
-  setInterval(updateStats, 5000);
-</script>
-</body>
-</html>
-"""
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--demo", action="store_true", help="Run in demo mode (no hardware)")
-    parser.add_argument("--port", type=str, default=None, help="Serial port for ESP32 e.g. /dev/cu.usbserial-0001")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description="Smart Access Monitor dashboard")
+    ap.add_argument("--demo", action="store_true", help="simulated events (separate database)")
+    ap.add_argument("--port", help="serial port, e.g. COM5 or /dev/cu.usbserial-0001 (auto-detected if omitted)")
+    ap.add_argument("--host", default="127.0.0.1", help="use 0.0.0.0 to open the dashboard to your network")
+    ap.add_argument("--http-port", type=int, default=5001)
+    ap.add_argument("--interval", type=float, default=4.0, help="demo: seconds between events")
+    ap.add_argument("--verbose", action="store_true", help="print every line from the board")
+    args = ap.parse_args()
 
-    init_db()
-    load_models()
+    source = "demo" if args.demo else "live"
+    scorer = AccessScorer.load()
+    print("Models loaded" if scorer.has_models else "No trained models found (run ml_models.py). Using rule checks only.")
 
-    if args.demo or args.port is None:
-        print("\n🎬 Starting in DEMO MODE (no hardware needed)")
-        print("   Run with --port /dev/cu.usbserial-XXXX for live ESP32 mode\n")
-        t = threading.Thread(target=demo_loop, daemon=True)
+    if args.demo:
+        if os.path.exists(DEMO_DB):
+            os.remove(DEMO_DB)     # each demo run starts clean; live data is never touched
+        sim = {"now": datetime.now().replace(hour=7, minute=0, second=0, microsecond=0)}
+        monitor = Monitor(EventStore(DEMO_DB), scorer, source, clock=lambda: sim["now"])
+        worker = threading.Thread(target=demo_worker, args=(monitor, args.interval, sim), daemon=True)
     else:
-        print(f"\n🔌 Starting in LIVE MODE on port {args.port}\n")
-        t = threading.Thread(target=live_loop, args=(args.port,), daemon=True)
+        monitor = Monitor(EventStore(LIVE_DB), scorer, source)
+        worker = threading.Thread(target=serial_worker, args=(monitor, args.port), daemon=True)
+    monitor.verbose = args.verbose
+    worker.start()
 
-    t.start()
-    print("🌐 Dashboard running at http://localhost:5000\n")
-    app.run(host="0.0.0.0", port=5001, debug=False, threaded=True)
+    print(f"Dashboard: http://{'127.0.0.1' if args.host in ('0.0.0.0', '') else args.host}:{args.http_port}")
+    app.run(host=args.host, port=args.http_port, debug=False, threaded=True)
