@@ -191,8 +191,14 @@
     }
     const trained = m.trained_at ? parseTs(m.trained_at.replace("T", " ")) : null;
     const who = m.profiles.length ? m.profiles.join(", ") : "nobody yet";
-    $("models").textContent = `Isolation Forest site model, plus behavioral profiles for ${who}.` +
+    let text = `Isolation Forest site model, plus behavioral profiles for ${who}.` +
       (trained ? ` Trained ${day(trained)} ${trained.getFullYear()}, ${hm(trained)}.` : "");
+    const sample = m.sample_profiles || [];
+    if (s.link.mode === "live" && sample.length) {
+      text += ` ${sample.join(", ")} still ${sample.length === 1 ? "uses" : "use"} the sample schedule, so ` +
+        `unusual-time alerts for them stop at Medium until they have real visits on ${m.min_live_days} different days.`;
+    }
+    $("models").textContent = text;
   }
 
   // ── chart: entries per hour, single series ──

@@ -55,7 +55,7 @@ RISK_MEDIUM = 50
 
 # Same key crossing the door again within this window is treated as possible
 # tailgating / key sharing by the dashboard (the firmware has its own check too).
-TAILGATE_WINDOW_S = 8
+TAILGATE_WINDOW_S = 5
 
 
 def person_for_key(ble_name):

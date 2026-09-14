@@ -31,7 +31,9 @@ from flask import Flask, Response, jsonify, request
 
 from config import (AUTHORIZED_KEYS, DEMO_DB, LIVE_DB, TAILGATE_WINDOW_S, UNKNOWN_PERSON,
                     RISK_MEDIUM, person_for_key)
-from ml_models import AccessScorer
+from ml_models import AccessScorer, MIN_LIVE_DAYS, retrain
+
+RETRAIN_EVERY = 10   # authorized live events between automatic retrains
 
 try:
     import serial
@@ -170,7 +172,29 @@ class Monitor:
         self.last_key_entry = {}    # ble_name -> datetime, for tailgating on legacy firmware
         self.count = 0
         self.verbose = False
+        self.since_retrain = 0
+        self.retraining = False
         self._restore()
+
+    def retrain_async(self):
+        """Refit the models with the real events logged so far, without blocking the reader."""
+        if self.source != "live" or self.retraining:
+            return
+        self.retraining = True
+
+        def run():
+            try:
+                bundle = retrain(db_path=self.store.path, verbose=False)
+                if bundle:
+                    self.scorer.bundle = bundle
+                    real = [p for p, prof in bundle["profiles"].items() if prof.get("from_live_data")]
+                    print(f"Models retrained. Profiles from real visits: {', '.join(real) or 'none yet'}")
+            except Exception as exc:
+                print(f"Retraining failed: {exc}")
+            finally:
+                self.retraining = False
+
+        threading.Thread(target=run, daemon=True).start()
 
     def _restore(self):
         """Rebuild who is inside from the log, so a dashboard restart doesn't forget."""
@@ -298,6 +322,11 @@ class Monitor:
                 "stay_min": stay, "people_inside": self.count, **scores,
             }
             event["id"] = self.store.insert(event)
+            if authorized:
+                self.since_retrain += 1
+                if self.since_retrain >= RETRAIN_EVERY:
+                    self.since_retrain = 0
+                    self.retrain_async()
 
         key_txt = f" ({ble_name}, {rssi} dBm)" if ble_name else ""
         print(f"{now:%H:%M:%S}  {action:<5}  {person}{key_txt}  risk {scores['risk']} {scores['alert_level']}"
@@ -330,7 +359,9 @@ class Monitor:
         if not self.scorer.has_models:
             return {"loaded": False}
         b = self.scorer.bundle
-        return {"loaded": True, "trained_at": b.get("trained_at"), "profiles": sorted(b["profiles"])}
+        return {"loaded": True, "trained_at": b.get("trained_at"), "profiles": sorted(b["profiles"]),
+                "sample_profiles": sorted(p for p, prof in b["profiles"].items() if not prof.get("from_live_data")),
+                "min_live_days": MIN_LIVE_DAYS}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -590,6 +621,9 @@ if __name__ == "__main__":
     else:
         monitor = Monitor(EventStore(LIVE_DB), scorer, source)
         worker = threading.Thread(target=serial_worker, args=(monitor, args.port), daemon=True)
+        monitor.retrain_async()   # pick up real events logged since the last training
+    # the demo replays the sample schedules, so those profiles are the ground truth there
+    scorer.trust_sample_data = args.demo
     monitor.verbose = args.verbose
     worker.start()
 

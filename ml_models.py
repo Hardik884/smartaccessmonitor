@@ -4,7 +4,11 @@ Smart Access Monitor - anomaly and behavioral models
 
     python generate.py                  # synthetic training data (access_log.csv)
     python ml_models.py                 # evaluate on a time-based holdout, then train and save
-    python ml_models.py --db access_monitor.db   # also learn from real logged events
+
+Training also reads the dashboard's access_monitor.db. A person's real visits replace
+their sample schedule once they cover 3 different days; until then scores from the
+sample profile are capped at MEDIUM. The dashboard retrains by itself as real events
+come in.
 
 Two models, both unsupervised (they never see the anomaly labels while training):
 
@@ -48,7 +52,7 @@ from sklearn.metrics import precision_recall_fscore_support, roc_auc_score
 from sklearn.mixture import GaussianMixture
 from sklearn.preprocessing import StandardScaler
 
-from config import MODEL_FILE, RISK_HIGH, RISK_MEDIUM, TRAINING_CSV, UNKNOWN_PERSON
+from config import LIVE_DB, MODEL_FILE, RISK_HIGH, RISK_MEDIUM, TRAINING_CSV, UNKNOWN_PERSON
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -57,6 +61,13 @@ MIN_VISITS_FOR_PROFILE = 8
 # Extra room beyond the training 1st percentile before a score reaches 50.
 # 0.25 gave ~2% false alarms and ~92% recall on the synthetic holdout.
 CALIBRATION_MARGIN = 0.25
+# Real visits on this many different days replace a person's sample schedule.
+MIN_LIVE_DAYS = 3
+# Until then, a profile built from sample data can raise a MEDIUM alert but never HIGH:
+# it describes a made-up routine, so it shouldn't shout.
+SAMPLE_PROFILE_CAP = RISK_MEDIUM + 10
+# Shorter "stays" are someone turning around in the doorway, not a visit.
+MIN_STAY_MIN = 2.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -114,8 +125,38 @@ def prepare(df):
     df["ts"] = pd.to_datetime(df["timestamp"])
     if "is_anomaly" not in df:
         df["is_anomaly"] = 0
+    if "source" not in df:
+        df["source"] = "synthetic"
     df["ble_name"] = df.get("ble_name", pd.Series("", index=df.index)).fillna("")
     return df
+
+
+def build_training_frame(csv_path=TRAINING_CSV, db_path=LIVE_DB, verbose=True):
+    """
+    Sample data from generate.py plus real events from the dashboard's database.
+    Once a person has real visits on MIN_LIVE_DAYS different days, their sample
+    rows are dropped, so the profile describes the real person, not the made-up one.
+    """
+    frames = []
+    if csv_path and os.path.exists(csv_path):
+        frames.append(pd.read_csv(csv_path).assign(source="synthetic"))
+    if db_path and os.path.exists(db_path):
+        frames.append(load_db_events(db_path).assign(source="live"))
+    if not frames:
+        return None
+    data = prepare(pd.concat(frames, ignore_index=True))
+
+    live_entries = data[(data["source"] == "live") & (data["action"] == "ENTER")]
+    for person, rows in live_entries.groupby("person"):
+        days = rows["ts"].dt.date.nunique()
+        if days >= MIN_LIVE_DAYS:
+            data = data[~((data["person"] == person) & (data["source"] == "synthetic"))]
+            if verbose:
+                print(f"  {person}: using {len(rows)} real entries over {days} days instead of sample data")
+        elif verbose:
+            print(f"  {person}: {days} day(s) of real data, sample schedule still used "
+                  f"(needs {MIN_LIVE_DAYS})")
+    return data
 
 
 def fit_site_model(entries):
@@ -131,6 +172,7 @@ def fit_site_model(entries):
         "calib": fit_calibration(model.score_samples(Xs)),
         "rssi_median": rssi_median,
         "n": len(entries),
+        "live_share": float((entries["source"] == "live").mean()) if len(entries) else 0.0,
     }
 
 
@@ -171,6 +213,7 @@ def fit_person_profile(entries, exits):
         "hour_center": float(center),
         "hour_window": (float(lo), float(hi)),
         "n_entries": int(len(entries)),
+        "from_live_data": bool((entries["source"] == "live").all()),
         "signal": None,
         "stay": None,
     }
@@ -186,7 +229,7 @@ def fit_person_profile(entries, exits):
         }
 
     stays = exits["stay_duration_min"].dropna().astype(float)
-    stays = stays[stays > 0]
+    stays = stays[stays >= MIN_STAY_MIN]
     if len(stays) >= MIN_VISITS_FOR_PROFILE:
         logs = np.log(stays)
         mu = float(np.median(logs))
@@ -235,8 +278,9 @@ def train_models(df, verbose=True):
 class AccessScorer:
     """Scores one access event. Works without trained models (rules only)."""
 
-    def __init__(self, bundle=None):
+    def __init__(self, bundle=None, trust_sample_data=False):
         self.bundle = bundle
+        self.trust_sample_data = trust_sample_data   # evaluation on synthetic data sets this
 
     @classmethod
     def load(cls, path=MODEL_FILE):
@@ -273,13 +317,17 @@ class AccessScorer:
             elif no_key:
                 reasons.append("Left without a key in range")
         elif self.bundle:
-            site = self.bundle["site"]
-            profile = self.bundle["profiles"].get(person)
+            bundle = self.bundle          # the dashboard may swap in a retrained bundle at any time
+            site = bundle["site"]
+            profile = bundle["profiles"].get(person)
+            stay = event.get("stay_duration_min")
 
             if action == "ENTER":
                 x = site_features(ts, rssi if rssi is not None else site["rssi_median"])
                 normality = site["model"].score_samples(site["scaler"].transform([x]))[0]
                 anomaly = calibrated_risk(site["calib"], normality)
+                if not self.trust_sample_data and site.get("live_share", 0.0) < 0.5:
+                    anomaly = min(anomaly, SAMPLE_PROFILE_CAP)
 
                 if profile:
                     behavioral, why = self._entry_behavior(profile, person, ts)
@@ -291,9 +339,12 @@ class AccessScorer:
                 else:
                     reasons.append(f"No behavioral profile for {person} yet")
 
-            elif profile and profile["stay"] and event.get("stay_duration_min") is not None:
-                behavioral, why = self._stay_behavior(profile["stay"], event["stay_duration_min"])
+            elif profile and profile["stay"] and stay is not None and stay >= MIN_STAY_MIN:
+                behavioral, why = self._stay_behavior(profile["stay"], stay)
                 reasons += why
+
+            if profile and not self.trust_sample_data and not profile.get("from_live_data", False):
+                behavioral = min(behavioral, SAMPLE_PROFILE_CAP)
 
         for rule_floor, reason in rule_hits:
             floor = max(floor, rule_floor)
@@ -384,7 +435,7 @@ def evaluate(df, holdout=0.3):
         return
 
     print(f"  Train: {len(train)} events before {cutoff:%Y-%m-%d}   Test: {len(test)} authorized events after")
-    scores = score_frame(AccessScorer(train_models(train, verbose=False)), test)
+    scores = score_frame(AccessScorer(train_models(train, verbose=False), trust_sample_data=True), test)
     y = test["is_anomaly"].values
 
     print("\n  ROC-AUC (1.0 = perfect ranking, 0.5 = random)")
@@ -415,6 +466,8 @@ def load_db_events(path):
         df = pd.read_sql_query(
             "SELECT timestamp, person, ble_name, action, rssi, stay_min AS stay_duration_min "
             "FROM events WHERE source = 'live' AND authorized = 1", conn)
+    except (sqlite3.Error, pd.errors.DatabaseError):
+        df = pd.DataFrame(columns=["timestamp", "person", "ble_name", "action", "rssi", "stay_duration_min"])
     finally:
         conn.close()
     df["is_anomaly"] = 0
@@ -422,32 +475,34 @@ def load_db_events(path):
     return df
 
 
+def retrain(csv_path=TRAINING_CSV, db_path=LIVE_DB, verbose=True):
+    """Build the training set, fit, save. Returns the bundle, or None without data."""
+    data = build_training_frame(csv_path, db_path, verbose=verbose)
+    if data is None:
+        return None
+    bundle = train_models(data, verbose=verbose)
+    tmp = MODEL_FILE + ".tmp"
+    with open(tmp, "wb") as f:
+        pickle.dump(bundle, f)
+    os.replace(tmp, MODEL_FILE)
+    return bundle
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Train the Smart Access Monitor models.")
-    ap.add_argument("--csv", default=TRAINING_CSV, help="training data from generate.py")
-    ap.add_argument("--db", help="also train on real events logged by the dashboard")
+    ap.add_argument("--csv", default=TRAINING_CSV, help="sample data from generate.py")
+    ap.add_argument("--db", default=LIVE_DB, help="real events logged by the dashboard (used if present)")
     ap.add_argument("--no-eval", action="store_true")
     args = ap.parse_args()
 
-    frames = []
-    if os.path.exists(args.csv):
-        frames.append(pd.read_csv(args.csv))
-        print(f"Loaded {len(frames[-1])} events from {args.csv}")
-    if args.db:
-        frames.append(load_db_events(args.db))
-        print(f"Loaded {len(frames[-1])} live authorized events from {args.db}")
-    if not frames:
-        raise SystemExit(f"No training data. Run `python generate.py` first or pass --db.")
-    data = pd.concat(frames, ignore_index=True)
-
     if not args.no_eval and os.path.exists(args.csv):
-        print("\nEvaluation (time-based holdout on labeled data)")
+        print("Evaluation on sample data (time-based holdout)")
         evaluate(pd.read_csv(args.csv))
 
-    print("\nTraining on all normal events")
-    bundle = train_models(data)
-    with open(MODEL_FILE, "wb") as f:
-        pickle.dump(bundle, f)
+    print("\nTraining")
+    bundle = retrain(args.csv, args.db)
+    if bundle is None:
+        raise SystemExit("No training data. Run `python generate.py` first.")
     print(f"Saved {MODEL_FILE}")
 
     print("\nExample events")

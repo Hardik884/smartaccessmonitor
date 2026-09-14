@@ -44,7 +44,8 @@ const unsigned long KEY_FRESH_MS       = 4000;   // key must have been heard thi
 const unsigned long KEY_GRACE_MS       = 1500;   // after a crossing, wait this long for a key
 const unsigned long CROSS_TIMEOUT_MS   = 3000;   // first beam broken but second never was
 const unsigned long STUCK_TIMEOUT_MS   = 15000;  // a beam blocked this long is ignored
-const unsigned long TAILGATE_MS        = 8000;   // same key entering twice inside this window
+const unsigned long TAILGATE_MS        = 5000;   // same key entering twice inside this window
+const unsigned long CLEAR_HOLD_MS      = 600;    // both beams must stay clear this long before re-arming
 const unsigned long STATUS_MS          = 5000;
 const bool          REQUIRE_KEY_TO_EXIT = false;
 const bool          DEBUG_DISTANCE      = false;
@@ -211,6 +212,7 @@ void decide(bool entering, unsigned long now) {
     auth = false;
   }
   if (auth && entering) sightings[key].enteredAt = now;
+  if (auth && !entering) sightings[key].enteredAt = 0;   // left again: next entry is a fresh one
 
   bool alarm = entering ? !auth : (REQUIRE_KEY_TO_EXIT && !auth);
 
@@ -277,7 +279,9 @@ void updateCrossing(unsigned long now) {
       break;
 
     case WAIT_CLEAR:
-      if (!a && !b)                            { crossState = IDLE; }
+      // a body between the sensors flickers the beams; only re-arm after a steady clear
+      if (a || b)                              { stateSince = now; }
+      else if (inState >= CLEAR_HOLD_MS)       { crossState = IDLE; }
       break;
   }
 }
